@@ -1,12 +1,28 @@
 #!/usr/bin/env python3
 """
 ================================================================
-ESPU INFERENCE - Single / Parallel / Router (абстенция + эскалация)
+POLAR INFERENCE - Single / Parallel / Router (abstention + escalation)
 ================================================================
-Mode Single: одна модель; Mode A: обе; Mode B: роутер с мягким шифтингом.
-Твики: Лаплас-калибровка, tie/uncertainty/ambiguity → обе,
-эскалация при отказе, пер-модельные параметры, ChatML всегда,
-ленивая загрузка моделей.
+Mode Single: one model answers (instruct or coder)
+Mode A (Parallel Twins): both models answer independently
+Mode B (Router): domain priority + soft shifting:
+  - tie (equal non-zero scores)       -> both models
+  - ambiguity (mixed task)            -> both models
+  - uncertainty (conf < threshold)    -> both models
+  - confident                         -> one model
+  - refusal signs from chosen model   -> escalation to the other
+
+Behavior tweaks:
+- Laplace-calibrated confidence: (winner+1)/(total+2)
+- per-model generation params (GEN_PARAMS)
+- ChatML always (no system role -> plain user/assistant)
+- lazy model loading into CPU RAM (one at a time, on demand)
+- GPU pinning with LRU eviction and TTL
+
+KV-caches:
+- Single: 1 cache
+- Mode A: 2 caches
+- Mode B: 1 cache (abstention/escalation -> 2)
 ================================================================
 """
 import torch
@@ -18,22 +34,27 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# ChatML-теги собираются здесь, чтобы не встречались в тексте файла сырыми
+# ChatML tags are assembled here so they never appear verbatim in source
 IM_START = "<" + "|im_start|" + ">"
 IM_END = "<" + "|im_end|" + ">"
 
 
 # ============================================================
-# ПОВЕДЕНЧЕСКИЕ ПАРАМЕТРЫ
+# BEHAVIOR PARAMETERS
 # ============================================================
+# Per-model generation params (soft shifting):
+# coder gets exact code without a repeat penalty (code legitimately
+# repeats), the conversational model gets a light anti-repeat.
 GEN_PARAMS = {
     'coder':    dict(repetition_penalty=1.0,  max_new_tokens=512),
     'instruct': dict(repetition_penalty=1.15, max_new_tokens=256),
 }
 
+# Confidence calibration (Laplace smoothing)
 LAPLACE = 1.0
 ABSTAIN_THRESHOLD = 0.6
 
+# Ambiguity detector: explicitly mixed tasks -> both models at once
 AMBIGUITY_PATTERNS = [
     r'\bthen\b', r'\bafter that\b', r'\band then\b',
     r'\balso\b', r'\badditionally\b',
@@ -43,6 +64,7 @@ AMBIGUITY_PATTERNS = [
     r'\b(write|implement|fix)\b.*\bexplain\b',
 ]
 
+# Signs that the model refused / could not answer
 FAILURE_SIGNALS = [
     r'\bi\s+cannot\b', r"\bi\s+can'?t\b", r'\bas an ai\b',
     r'\bnot\s+(?:able|allowed) to\b', r'\bapologi[sz]e\b',
@@ -53,18 +75,20 @@ _FAIL = [re.compile(p, re.I) for p in FAILURE_SIGNALS]
 
 
 def looks_like_refusal(text: str) -> bool:
+    """Refusal signs in the first 400 characters of the answer."""
     head = text[:400]
     return any(p.search(head) for p in _FAIL)
 
 
 # ============================================================
-# МЕНЕДЖЕР МОДЕЛЕЙ (ленивая загрузка + GPU-пиннинг с TTL)
+# MODEL MANAGER (lazy loading + GPU pinning with TTL)
 # ============================================================
 class ModelManager:
     """
-    Токенизаторы — сразу, модели — лениво (по первому обращению).
-    Резидентные модели держатся на GPU до TTL или LRU-вытеснения.
-    Это убирает PCIe-трэшинг в parallel/abstention режимах.
+    Tokenizers are loaded upfront (cheap); models are loaded lazily,
+    one at a time, on first use. Resident models stay on the GPU
+    until TTL expiry or LRU eviction, which removes PCIe thrashing
+    in parallel/abstention modes.
     """
     def __init__(self, models_config: Dict[str, Path], weights_files: Dict[str, Path],
                  layer_info_files: Dict[str, Path],
@@ -73,50 +97,44 @@ class ModelManager:
         self.models_config = models_config
         self.weights_files = weights_files
         self.layer_info_files = layer_info_files
-        self.models = {}                     # name → model (в CPU RAM или GPU)
+        self.models = {}
         self.tokenizers = {}
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-        # LRU-трекинг резидентных на GPU: name → last_used_timestamp
+        # LRU tracking of GPU-resident models: name -> last-used timestamp
         self.resident_on_gpu: Dict[str, float] = {}
 
-        # Автодетект лимита по VRAM
         if max_resident_models is None:
             max_resident_models = self._autodetect_resident_limit()
         self.max_resident = max_resident_models
         self.pin_ttl = pin_ttl_seconds
 
-        # Только токенизаторы сразу
+        # Tokenizers only, upfront
         for name, model_path in models_config.items():
             tok = AutoTokenizer.from_pretrained(model_path)
             if tok.pad_token is None:
                 tok.pad_token = tok.eos_token
             self.tokenizers[name] = tok
 
-        print(f"   📌 GPU-пиннинг: max {self.max_resident} моделей, "
+        print(f"   [PIN] GPU pinning: max {self.max_resident} model(s), "
               f"TTL {self.pin_ttl}s")
 
     def _autodetect_resident_limit(self) -> int:
-        """Выбираем лимит по VRAM: 2 модели ≈ 13 ГБ нужно."""
+        """Pick the resident limit from available VRAM."""
         if not torch.cuda.is_available():
-            return 0
+            return 1
         try:
             vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            # С запасом 20% под KV-кэш и генерацию
-            if vram >= 15:
-                return 2
-            if vram >= 9:
-                return 1
-            return 0
+            return 2 if vram >= 15 else 1
         except Exception:
             return 1
 
     def _ensure_loaded(self, model_name: str):
-        """Ленивая загрузка в CPU RAM (если ещё не загружена)."""
+        """Lazy load into CPU RAM + weight replacement (once)."""
         if model_name in self.models:
             return
         from polar_packer import replace_model_weights
-        print(f"   📦 Загрузка {model_name} в CPU RAM...")
+        print(f"   [LOAD] Loading {model_name} into CPU RAM...")
         model = AutoModelForCausalLM.from_pretrained(
             self.models_config[model_name], torch_dtype=torch.float16,
             device_map='cpu', low_cpu_mem_usage=True
@@ -125,10 +143,10 @@ class ModelManager:
             model, self.weights_files[model_name], self.layer_info_files[model_name])
         model.eval()
         self.models[model_name] = model
-        print(f"   ✅ {model_name} готов")
+        print(f"   [OK] {model_name} ready")
 
     def _expire_ttl(self, now: float):
-        """Lazy TTL: выгружаем просроченные резидентные модели."""
+        """Lazy TTL: evict expired resident models."""
         if self.pin_ttl is None:
             return
         expired = [n for n, t in self.resident_on_gpu.items()
@@ -137,7 +155,7 @@ class ModelManager:
             self._evict_to_cpu(name)
 
     def _evict_to_cpu(self, name: str):
-        """Выгружает модель с GPU обратно в CPU RAM."""
+        """Move a model off the GPU back into CPU RAM."""
         if name not in self.resident_on_gpu:
             return
         model = self.models.get(name)
@@ -148,25 +166,22 @@ class ModelManager:
 
     def _ensure_on_gpu(self, model_name: str):
         """
-        Гарантирует, что модель на GPU. Если лимит превышен —
-        вытесняет самую старую по LRU.
+        Guarantee the model is on the GPU. If the limit is exceeded,
+        evict the least recently used resident first.
         """
         now = time.time()
-
-        # Lazy TTL-выгрузка
         self._expire_ttl(now)
 
-        # Уже резидентна — просто обновляем timestamp
+        # Already resident: just refresh the timestamp
         if model_name in self.resident_on_gpu:
             self.resident_on_gpu[model_name] = now
             return
 
-        # Освобождаем место LRU-вытеснением
+        # Free space via LRU eviction
         while len(self.resident_on_gpu) >= self.max_resident and self.resident_on_gpu:
             oldest = min(self.resident_on_gpu, key=self.resident_on_gpu.get)
             self._evict_to_cpu(oldest)
 
-        # Перенос на GPU
         self.models[model_name].to(self.device)
         self.resident_on_gpu[model_name] = now
 
@@ -183,10 +198,11 @@ class ModelManager:
         if repetition_penalty is None:
             repetition_penalty = p.get('repetition_penalty', 1.15)
 
-        # Пиннинг на GPU (без тогл туда-обратно)
+        # Pin on GPU (no back-and-forth transfers)
         self._ensure_on_gpu(model_name)
 
-        # ChatML всегда: без system-роли — просто user/assistant
+        # ChatML always: without a system role - plain user/assistant,
+        # otherwise models complete the raw prefix instead of answering
         if system_role:
             full_prompt = (
                 IM_START + "system\n" + system_role + IM_END + "\n"
@@ -217,11 +233,11 @@ class ModelManager:
         text = tokenizer.decode(outputs[0][input_len:],
                                 skip_special_tokens=True).strip()
 
-        # НЕ выгружаем — модель остаётся резидентной до TTL/LRU
+        # No offload here: the model stays resident until TTL/LRU
         return text, elapsed
 
     def force_evict(self, name: str):
-        """Принудительная выгрузка (для ручного управления памятью)."""
+        """Manual eviction (for explicit memory control)."""
         self._evict_to_cpu(name)
 
     def cleanup(self):
@@ -234,7 +250,7 @@ class ModelManager:
 
 
 # ============================================================
-# ROUTER (без версий: единственный класс)
+# ROUTER (single class, no versions)
 # ============================================================
 @dataclass
 class RoutingDecision:
@@ -248,8 +264,8 @@ class RoutingDecision:
 
 class ModelRouter:
     """
-    Доменный приоритет + Лаплас-калибровка confidence.
-    Веса: task verbs 3, domain concepts 6, code-in-prompt 2, weak 1.
+    Domain priority + Laplace-calibrated confidence.
+    Weights: task verbs 3, domain concepts 6, code-in-prompt 2, weak 1.
     """
     TASK_VERBS_CODER = [
         r'\bwrite\s+(a|an|the)?\s*(python|c|c\+\+|java|javascript|js|rust|go|ruby|php|sql|html|css)?\s*(function|program|script|class|method|module|api|endpoint|code|query)',
@@ -288,7 +304,7 @@ class ModelRouter:
         r'\btransformer\b', r'\battention\s+mechanism\b', r'\bgradient\s+descent\b',
         r'\bbackpropagation\b', r'\bconvolutional\b', r'\brecurrent\s+network\b',
     ]
-    # без паттерна return (ложняк на прозе)
+    # No bare "return" pattern (false positives on prose)
     CODE_IN_PROMPT = [
         r'\bdef\s+\w+\s*\(', r'\bfunction\s+\w+\s*\(',
         r'#include\b', r'\bSELECT\b.*\bFROM\b', r'\bfor\s*\(.+;.+\)',
@@ -374,7 +390,7 @@ class ModelRouter:
         if code_score == general_score:
             model = 'instruct'
             confidence = 0.5
-            reasoning = f"Tie ({code_score:.0f} vs {general_score:.0f}) → Instruct"
+            reasoning = f"Tie ({code_score:.0f} vs {general_score:.0f}) -> Instruct"
         elif code_score > general_score:
             model = 'coder'
             confidence = (code_score + LAPLACE) / (total + 2 * LAPLACE)
@@ -392,7 +408,7 @@ class ModelRouter:
 
 
 # ============================================================
-# РЕЖИМЫ
+# MODES
 # ============================================================
 def _gen(manager, name, prompt, max_new_tokens):
     p = GEN_PARAMS[name]
@@ -428,8 +444,8 @@ def mode_b_router(manager: ModelManager, prompt: str,
                   max_new_tokens: Optional[int] = None,
                   abstain_threshold: float = ABSTAIN_THRESHOLD) -> Dict:
     """
-    Мягкий шифтинг: tie/uncertainty/ambiguity → обе;
-    уверен → одна; отказ выбранной → эскалация ко второй.
+    Soft shifting: tie/ambiguity/uncertainty -> both models;
+    confident -> one model; refusal of the chosen one -> escalation.
     """
     decision = ModelRouter().route(prompt)
 
@@ -451,7 +467,7 @@ def mode_b_router(manager: ModelManager, prompt: str,
 
     if reason is not None:
         return {
-            'mode': f'B (Router) → abstention[{reason}] → Parallel',
+            'mode': f'B (Router) -> abstention[{reason}] -> Parallel',
             'prompt': prompt, 'kv_caches': 2, 'abstained': True,
             'routing': routing,
             'results': _run_both(manager, prompt, max_new_tokens),
@@ -464,7 +480,7 @@ def mode_b_router(manager: ModelManager, prompt: str,
         fallback = 'coder' if primary == 'instruct' else 'instruct'
         second = _gen(manager, fallback, prompt, max_new_tokens)
         return {
-            'mode': 'B (Router) → escalation → Parallel',
+            'mode': 'B (Router) -> escalation -> Parallel',
             'prompt': prompt, 'kv_caches': 2, 'abstained': True,
             'routing': {**routing, 'escalated_from': primary,
                         'escalation_reason': 'refusal_signals'},
