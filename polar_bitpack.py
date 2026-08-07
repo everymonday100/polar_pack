@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
 ================================================================
-ESPU BITPACK - настоящий формат .dualpack (version 2)
+POLAR BITPACK - actual .dualpack format
 ================================================================
-Лосслесс-сериализация лосси-кодов:
-  пара весов (w1, w2) → 2 байта: [amp 6 бит | phase 10 бит]
-  + fp16 шкалы групп (1 на 32 пары)
-  + plug-таблица: (uint32 индекс, fp16 точная амплитуда)
+Lossless serialization of lossy codes:
+  weight pair (w1, w2) -> 2 bytes: [amp 6 bits | phase 10 bits]
+  + fp16 group scales (1 per 32 pairs)
+  + plug table: (uint32 index, fp16 exact amplitude)
 
 Layout:
   [header struct][codes 2B*n_pairs][scales 2B*n_groups]
   [plug_idx 4B*plug_n][plug_val 2B*plug_n]
 
-Итог: ~2.24 байта/пара ≈ 8.97 бит/вес, сжатие ~1.78x
-(две FP16-модели в ~1.12 места одной)
+Result: ~2.24 bytes/pair = 8.97 bits/weight, compression ~1.78x
+(two FP16 models in ~1.12 places of one)
 ================================================================
 """
 import struct
@@ -28,14 +28,13 @@ VERSION = 2
 HEADER_FMT = '<8s I Q Q Q B B f I Q Q'
 # magic, version, n_pairs, n1, n2, amp_bits, phase_bits, mu, group_size, chunk_size, plug_n
 
-
 # ============================================================
-# КОДЕК С ВОЗВРАТОМ КОДОВ (амплитуда)
+# CODEC WITH CODE RETURN (amplitude)
 # ============================================================
 def quantize_amplitude_codes(amp_flat: np.ndarray, config):
     """
-    Как quantize_amplitude_production, но возвращает коды для бит-пакинга.
-    Returns: (amp_q uint8 ПЛОСКИЙ, bmax_fp16, plug_idx uint32, plug_val fp16, decoded)
+    Like quantize_amplitude_production, but returns codes for bit-packing.
+    Returns: (amp_q uint8 FLAT, bmax_fp16, plug_idx uint32, plug_val fp16, decoded)
     """
     levels = 2 ** config.amp_bits - 1
     ol = amp_flat.size
@@ -53,13 +52,13 @@ def quantize_amplitude_codes(amp_flat: np.ndarray, config):
     log_mu = np.log1p(config.mu)
     compressed = np.sign(norm) * np.log1p(config.mu * np.abs(norm)) / log_mu
 
-    # коды в 2D (группы x gs) — нужны для per-group декомпрессии decoded
+    # codes in 2D (groups x gs) - needed for per-group decoded decompression
     amp_q2d = np.round(compressed * levels).clip(0, levels).astype(np.uint8)
 
     restored_norm = np.expm1(amp_q2d.astype(np.float64) / levels * log_mu) / config.mu
     decoded = (restored_norm * bmax).ravel()[:ol].copy()
 
-    # ВАЖНО: наружу коды уходят ПЛОСКИМИ, длиной ol
+    # IMPORTANT: codes go out FLAT, length ol
     amp_q = amp_q2d.ravel()[:ol]
 
     plug_idx = np.array([], dtype=np.uint32)
@@ -76,9 +75,8 @@ def quantize_amplitude_codes(amp_flat: np.ndarray, config):
 
     return amp_q, bmax.astype(np.float16).ravel(), plug_idx, plug_val, decoded
 
-
 # ============================================================
-# СЕРИАЛИЗАЦИЯ БАЙТОВ (явный big-endian на пару, портабельно)
+# BYTE SERIALIZATION (explicit big-endian per pair, portable)
 # ============================================================
 def _interleave(combined_u32: np.ndarray) -> np.ndarray:
     out = np.empty(combined_u32.size * 2, dtype=np.uint8)
@@ -89,15 +87,14 @@ def _interleave(combined_u32: np.ndarray) -> np.ndarray:
 def _deinterleave(buf_u8: np.ndarray) -> np.ndarray:
     return (buf_u8[0::2].astype(np.uint32) << 8) | buf_u8[1::2].astype(np.uint32)
 
-
 # ============================================================
-# УПАКОВКА В .dualpack
+# PACK INTO .dualpack
 # ============================================================
 def pack_dual_models_packed(file1, file2, n1, n2, out_packed: Path, config):
     from polar_packer import PackingStats
 
     phase_bits = 16 - config.amp_bits
-    assert 2 ** phase_bits >= config.num_phases, "amp_bits + phase_bits должно быть 16"
+    assert 2 ** phase_bits >= config.num_phases, "amp_bits + phase_bits must be 16"
 
     fp1 = np.memmap(str(file1), dtype='float32', mode='r')
     fp2 = np.memmap(str(file2), dtype='float32', mode='r')
@@ -119,7 +116,7 @@ def pack_dual_models_packed(file1, file2, n1, n2, out_packed: Path, config):
         if len(w1) < L: w1 = np.pad(w1, (0, L - len(w1)))
         if len(w2) < L: w2 = np.pad(w2, (0, L - len(w2)))
 
-        # Полярные коды
+        # Polar codes
         amplitude = np.sqrt(w1 ** 2 + w2 ** 2)
         phase = np.arctan2(w2, w1)
         phase_idx = (np.round((phase + np.pi) / (2 * np.pi) * config.num_phases)
@@ -134,7 +131,7 @@ def pack_dual_models_packed(file1, file2, n1, n2, out_packed: Path, config):
         codes_parts.append(_interleave(combined))
         scales_parts.append(bmax16)
 
-        # Метрики (реконструкция как в unpack)
+        # Metrics (reconstruction as in unpack)
         amp = decoded
         if plug_idx.size:
             amp = amp.copy()
@@ -152,7 +149,7 @@ def pack_dual_models_packed(file1, file2, n1, n2, out_packed: Path, config):
             sum_dot2 += float((o * r).sum()); sum_sq2_o += float((o * o).sum()); sum_sq2_r += float((r * r).sum())
 
         if (chunk_idx + 1) % 10 == 0 or chunk_idx == n_chunks - 1:
-            print(f"   Чанк {chunk_idx + 1}/{n_chunks}")
+            print(f"   Chunk {chunk_idx + 1}/{n_chunks}")
 
     plug_i = np.concatenate(plug_i_parts) if plug_i_parts else np.array([], np.uint32)
     plug_v = np.concatenate(plug_v_parts) if plug_v_parts else np.array([], np.float16)
@@ -191,16 +188,15 @@ def pack_dual_models_packed(file1, file2, n1, n2, out_packed: Path, config):
         throughput_mweights_per_sec=round(n1 / (time.time() - t0) / 1e6, 2)
     )
 
-
 # ============================================================
-# РАСПАКОВКА ИЗ .dualpack
+# UNPACK FROM .dualpack
 # ============================================================
 def unpack_dual_models(packed: Path, out1: Path, out2: Path):
     with open(packed, 'rb') as f:
         hs = struct.calcsize(HEADER_FMT)
         (magic, ver, n_pairs, n1, n2, amp_bits, phase_bits, mu,
          gs, chunk_size, plug_n) = struct.unpack(HEADER_FMT, f.read(hs))
-        assert magic == MAGIC and ver == VERSION, "не тот формат .dualpack"
+        assert magic == MAGIC and ver == VERSION, "wrong .dualpack format"
 
         codes = _deinterleave(np.frombuffer(f.read(n_pairs * 2), dtype=np.uint8))
         n_groups = 0
@@ -248,4 +244,4 @@ def unpack_dual_models(packed: Path, out1: Path, out2: Path):
     out1_fp.flush()
     out2_fp.flush()
     del out1_fp, out2_fp
-    print(f"   ✅ Распаковано: {out1.name}, {out2.name}")
+    print(f"   [OK] Unpacked: {out1.name}, {out2.name}")
