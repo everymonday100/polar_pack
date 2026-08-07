@@ -150,7 +150,7 @@ pytest test_polar_inference.py -v   # 36 passed
 
 ## Roadmap
 
-- [ ] Fused CUDA decode kernel (close the remaining 18%)
+- [ ] Fused CUDA decode kernel (close the remaining 10%)
 - [ ] GGUF / llama.cpp port (`Q_POLAR` block type)
 - [ ] Quantization-aware training in polar space
 - [ ] N-model packing via quaternions (4 models per weight stream)
