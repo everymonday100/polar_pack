@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-================================================================
-ESPU POLAR KERNELS FINAL - Bit-packing + Shared Memory + Autotune
-================================================================
-Потолок Triton: 16 бит/вес (bit-packed), LUT в shared memory,
-автоматический тюнинг tile sizes для RTX 4060.
-================================================================
-"""
 import torch
 import triton
 import triton.language as tl
@@ -14,20 +6,11 @@ import math
 import time
 
 
-# ============================================================
-# BIT-PACKING UTILS
-# ============================================================
-def pack_amp_phase(amp_q: torch.Tensor, phase_q: torch.Tensor) -> torch.Tensor:
-    """amp (6 бит) + phase (10 бит) -> 16 бит.
-    Храним как INT16: смещение -32768 сохраняет битовый паттерн,
-    обходя отсутствие uint16 bitwise-опов в PyTorch CUDA."""
+def pack_amp_phase(amp_q, phase_q):
     packed = ((amp_q.to(torch.int32) & 0x3F) << 10) | (phase_q.to(torch.int32) & 0x3FF)
     return (packed - 32768).to(torch.int16)
 
 
-# ============================================================
-# TRITON KERNEL: Bit-packed + Shared Memory LUT
-# ============================================================
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_warps=2),
@@ -52,9 +35,6 @@ def polar_dual_bitpacked_kernel(
     sin_shift: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    """
-    Bit-packed polar dual matmul с shared memory для LUT.
-    """
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     pid_m = pid // num_pid_n
@@ -73,25 +53,20 @@ def polar_dual_bitpacked_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         mask_k = offs_k[None, :] < K - k * BLOCK_K
         mask_b = offs_k[:, None] < K - k * BLOCK_K
-        
         a = tl.load(a_ptrs, mask=mask_k, other=0.0)
         packed = tl.load(packed_ptrs, mask=mask_b, other=0)
 
-        # Unpack: int16 -> unsigned через +32768, затем битовые поля
         packed_u = packed.to(tl.int32) + 32768
         amp_q = (packed_u >> 10) & 0x3F
         phase_q = packed_u & 0x3FF
 
-        # Dequant через shared memory LUT
         amp_norm = tl.load(amp_lut_ptr + amp_q, mask=mask_b, other=0.0)
 
-        # Per-group scale
         k_global = k * BLOCK_K + offs_k[:, None]
         group_idx = (k_global * N + offs_bn[None, :]) // group_size
         bmax = tl.load(bmax_ptr + group_idx, mask=mask_b, other=1.0)
         amplitude = amp_norm * bmax.to(tl.float32)
 
-        # cos и sin из shared memory
         cos_v = tl.load(cos_lut_ptr + phase_q, mask=mask_b, other=0.0)
         sin_v = tl.load(cos_lut_ptr + ((phase_q + sin_shift) % num_phases),
                         mask=mask_b, other=0.0)
@@ -161,15 +136,13 @@ def quantize_polar_bitpacked(w1, w2, amp_bits=6, num_phases=1024, mu=255, group_
              .to(torch.int8).flatten()[:total].reshape(K, N))
     bmax = bmax.flatten().to(torch.float16)
 
-    # Bit-packing
     packed = pack_amp_phase(amp_q, phase_q)
 
-    # LUT'ы
     phases = torch.linspace(-math.pi, math.pi, num_phases + 1)[:-1]
     cos_lut = torch.cos(phases).to(torch.float16).to(w1.device)
     i = torch.arange(levels + 1, dtype=torch.float32)
     amp_lut = ((torch.exp(i / levels * log_mu) - 1.0) / mu).to(torch.float16).to(w1.device)
-    
+
     return packed, bmax, amp_lut, cos_lut
 
 
@@ -179,11 +152,11 @@ if __name__ == "__main__":
     w2 = torch.randn(K, N, dtype=torch.float16, device='cuda')
     packed, bmax, amp_lut, cos_lut = quantize_polar_bitpacked(w1, w2)
 
-    print("Bit-packed polar format: 16 бит/вес (6 амплитуда + 10 фаза)")
+    print("Bit-packed polar format: 16 bits/weight (6 amplitude + 10 phase)")
     print(f"Memory: packed {packed.element_size() * packed.numel() / 1e6:.1f} MB "
           f"vs fp16 dual {2 * w1.element_size() * w1.numel() / 1e6:.1f} MB")
 
-    print(f"\n{'M':>5} | {'polar bitpacked':>15} | {'fp16 dual':>10} | speedup")
+    print(f"{'M':>5} | {'polar bitpacked':>15} | {'fp16 dual':>10} | speedup")
     for M in [1, 8, 32, 128, 1024]:
         a = torch.randn(M, K, dtype=torch.float16, device='cuda')
         for _ in range(10):
