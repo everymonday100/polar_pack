@@ -100,10 +100,11 @@ A fused bit-packed dual matmul serves **both models in one pass**:
 
 | M (batch) | polar dual | fp16 dual (cuBLAS) | ratio |
 |---|---|---|---|
-| 1 (decode) | 0.33 ms | 0.27 ms | **0.82×** |
-| 8 | 0.33 ms | 0.28 ms | 0.85× |
-| 32 | 0.49 ms | 0.27 ms | 0.55× |
-| 1024 (prefill) | 5.79 ms | 2.26 ms | 0.39× |
+| 1 (decode) | 0.30 ms | 0.27 ms | **0.90×** |
+| 8 | 0.30 ms | 0.28 ms | 0.93× |
+| 32 | 0.30 ms | 0.28 ms | 0.92× |
+| 128 | 0.77 ms | 0.29 ms | 0.38× |
+| 1024 (prefill) | 5.82 ms | 2.29 ms | 0.39× |
 
 At decode, two models run at 82% of the cost of two FP16 GEMMs while reading
 **2× less weight traffic** (33.6 vs 67.1 MB per 4096² layer). Prefill stays with
