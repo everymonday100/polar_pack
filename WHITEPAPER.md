@@ -195,12 +195,11 @@ Optimization journey at M=1, included because the failures are instructive:
 | LUT dequant + fixed per-group indexing | 0.22x | accuracy fixed (22% -> 2.4% rel. error), speed unchanged: wrong benchmark |
 | dual matmul + INT16 phase | 0.35x | compare what the format is actually for: two models per pass |
 | bit-packed uint16 + autotune | 0.83x | packing + tile tuning; LUTs live in L1 |
+| **GEMV-optimized tiles (BLOCK_M=1)** | **0.90x** | **final: aggressive autotune with small M tiles** |
 
-The remaining ~17% at decode is dequant ALU and gather latency; closing it
+The remaining ~10% at decode is dequant ALU and gather latency; closing it
 needs a hand-written CUDA kernel with warp-level fused dequant (see Future
-work). Notably, a single-model polar kernel can never beat FP16 cuBLAS at all:
-6+10 bits round up to the same 16 bits FP16 occupies. The dual view is the
-whole point.
+work).
 
 ## 7. CPU: where the format honestly wins
 
@@ -236,7 +235,7 @@ edge devices more than raw token rate.
 
 ## 10. Future work
 
-- Fused CUDA decode kernel (warp-level dequant) to close the remaining 17%.
+- Fused CUDA decode kernel (warp-level dequant) to close the remaining 10%.
 - GGUF / llama.cpp port as a `Q_POLAR` block type, so the ecosystem can consume
   the format directly.
 - Quantization-aware training in polar space (teach the model to live at
