@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-Тесты для polar_inference.py — поведенческие твики.
-Запуск: pytest test_polar_inference.py -v
-Время: ~2 секунды (без реальных моделей).
+Tests for polar_inference.py - behavior tweaks.
+Run: pytest test_polar_inference.py -v
+Time: ~2 seconds (no real models involved).
 """
-import pytest
 import time
+import pytest
+import torch
 from unittest.mock import Mock, patch, MagicMock
 from pathlib import Path
 
-# Импорты тестируемых сущностей
 from polar_inference import (
     ModelRouter, ModelManager,
     mode_single, mode_a_parallel, mode_b_router,
     looks_like_refusal,
-    GEN_PARAMS, LAPLACE, ABSTAIN_THRESHOLD,
+    GEN_PARAMS,
 )
 
 
 # ============================================================
-# Фикстуры
+# FIXTURES
 # ============================================================
 @pytest.fixture
 def router():
@@ -28,22 +28,18 @@ def router():
 
 @pytest.fixture
 def mock_manager():
-    """Мок ModelManager: возвращает предсказуемые тексты."""
+    """Mock ModelManager: predictable texts + call log for assertions."""
     m = Mock(spec=ModelManager)
+    m.call_log = []
 
     def fake_generate(model_name, prompt, system_role="",
                       max_new_tokens=None, repetition_penalty=None):
-        # Записываем параметры для проверки
-        if not hasattr(m, 'call_log'):
-            m.call_log = []
         m.call_log.append({
             'model': model_name,
             'max_new_tokens': max_new_tokens,
             'repetition_penalty': repetition_penalty,
         })
-        # Ответ зависит от модели (чтобы отличать)
-        text = f"[{model_name}] response to: {prompt[:30]}"
-        return text, 0.5
+        return f"[{model_name}] response to: {prompt[:30]}", 0.5
 
     m.generate.side_effect = fake_generate
     return m
@@ -51,20 +47,21 @@ def mock_manager():
 
 @pytest.fixture
 def mock_manager_with_refusal(mock_manager):
-    """Мок, где instruct выдаёт отказ, coder — нормальный ответ."""
+    """Mock where instruct refuses and coder answers normally."""
+    mock_manager.call_log = []
+
     def fake_generate(model_name, prompt, **kwargs):
-        if not hasattr(mock_manager, 'call_log'):
-            mock_manager.call_log = []
         mock_manager.call_log.append({'model': model_name, **kwargs})
         if model_name == 'instruct':
             return "I cannot help with that. As an AI...", 0.5
         return "Here is the code...", 0.5
+
     mock_manager.generate.side_effect = fake_generate
     return mock_manager
 
 
 # ============================================================
-# 1. Лаплас-калибровка confidence
+# 1. LAPLACE CALIBRATION
 # ============================================================
 class TestLaplaceCalibration:
     """(winner + 1) / (total + 2)"""
@@ -74,46 +71,45 @@ class TestLaplaceCalibration:
         assert d.confidence == 0.5
 
     def test_single_weak_signal(self, router):
-        # "python" → code=1, general=0 → (1+1)/(1+2)=0.667
+        # "python" -> code=1, general=0 -> (1+1)/(1+2)=0.667
         d = router.route("python")
         assert d.model == 'coder'
         assert abs(d.confidence - 2/3) < 0.01
 
     def test_strong_code_signal(self, router):
-        # "write a python function" → task verb (3) + weak (1) = 4
-        # vs 0 → (4+1)/(4+2) = 5/6 ≈ 0.833
+        # "write a python function" -> task verb (3) + weak (1) = 4
+        # vs 0 -> (4+1)/(4+2) = 5/6 = 0.833
         d = router.route("write a python function")
         assert d.model == 'coder'
         assert abs(d.confidence - 5/6) < 0.01
 
     def test_tie_nonzero(self, router):
-        # "explain python" → explain (+1 general) vs python (+1 code)
-        # code_score == general_score → confidence = 0.5
+        # "explain python" -> explain (+1 general) vs python (+1 code)
+        # equal scores -> confidence = 0.5
         d = router.route("explain python")
         assert d.code_score == d.general_score
         assert d.confidence == 0.5
 
     def test_moderate_confidence(self, router):
-        # "what is wrong with this code" → task verb coder (3) + "what is" general (1)
-        # code=3, general=1 → (3+1)/(4+2) = 2/3 ≈ 0.667
+        # "what is wrong with this code" -> task verb coder (3)
+        # + "what is" general (1) -> (3+1)/(4+2) = 2/3
         d = router.route("what is wrong with this code")
         assert d.model == 'coder'
         assert abs(d.confidence - 2/3) < 0.01
 
 
 # ============================================================
-# 2. Убранный return-паттерн не срабатывает на прозе
+# 2. REMOVED RETURN-PATTERN DOES NOT FIRE ON PROSE
 # ============================================================
 class TestReturnPatternFix:
     def test_return_in_prose_not_counted(self, router):
-        # Обычный английский текст не должен давать code_score
         d = router.route("return the book to the library")
         assert d.code_score == 0
-        assert d.model == 'instruct'  # default при 0-0
+        assert d.model == 'instruct'  # default on 0-0
 
 
 # ============================================================
-# 3. looks_like_refusal
+# 3. REFUSAL DETECTION
 # ============================================================
 class TestRefusalDetection:
     @pytest.mark.parametrize("text", [
@@ -130,34 +126,31 @@ class TestRefusalDetection:
         "Here is the code:",
         "A segmentation fault is...",
         "def hello():\n    print('hello')",
-        "I can help you with that.",  # "I can" не должно ловиться!
+        "I can help you with that.",  # "I can" must NOT match
     ])
     def test_ignores_normal(self, text):
         assert looks_like_refusal(text) is False
 
 
 # ============================================================
-# 4. Абстенция по uncertainty (низкая confidence)
+# 4. ABSTENTION: UNCERTAINTY (low confidence)
 # ============================================================
 class TestAbstentionUncertainty:
     def test_low_confidence_triggers_both(self, mock_manager):
-        # Промпт без явных сигналов — должна быть абстенция
-        # "hello" → 0 vs 0 → 0.5 < 0.6 → uncertainty
+        # "hello" -> 0 vs 0 -> 0.5 < 0.6 -> uncertainty
         result = mode_b_router(mock_manager, "hello")
         assert result['abstained'] is True
         assert 'uncertainty' in result['mode']
-        # Обе модели должны быть вызваны
         models_called = [c['model'] for c in mock_manager.call_log]
         assert 'instruct' in models_called
         assert 'coder' in models_called
 
 
 # ============================================================
-# 5. Абстенция по tie (равные ненулевые сигналы)
+# 5. ABSTENTION: TIE (equal non-zero scores)
 # ============================================================
 class TestAbstentionTie:
     def test_tie_triggers_both(self, mock_manager):
-        # "explain python" → explain (1 general) vs python (1 code)
         result = mode_b_router(mock_manager, "explain python")
         assert result['abstained'] is True
         assert 'tie' in result['mode']
@@ -166,7 +159,7 @@ class TestAbstentionTie:
 
 
 # ============================================================
-# 6. Абстенция по ambiguity (смешанная задача)
+# 6. ABSTENTION: AMBIGUITY (mixed task)
 # ============================================================
 class TestAbstentionAmbiguity:
     @pytest.mark.parametrize("prompt", [
@@ -182,7 +175,7 @@ class TestAbstentionAmbiguity:
 
 
 # ============================================================
-# 7. Уверенный выбор одной модели
+# 7. CONFIDENT ROUTING (single model)
 # ============================================================
 class TestConfidentRouting:
     def test_code_prompt_goes_to_coder(self, mock_manager):
@@ -202,23 +195,23 @@ class TestConfidentRouting:
 
 
 # ============================================================
-# 8. Эскалация при отказе выбранной модели
+# 8. ESCALATION ON REFUSAL OF THE CHOSEN MODEL
 # ============================================================
 class TestEscalation:
     def test_refusal_triggers_fallback(self, mock_manager_with_refusal):
-        # "translate to French" → instruct (уверенно)
-        # но instruct отвечает "I cannot..." → эскалация к coder
+        # "translate to French" -> instruct (confident),
+        # but instruct answers "I cannot..." -> escalation to coder
         result = mode_b_router(
             mock_manager_with_refusal, "translate to French")
         assert result['abstained'] is True
         assert 'escalation' in result['mode']
         assert result['routing']['escalation_reason'] == 'refusal_signals'
         models_called = [c['model'] for c in mock_manager_with_refusal.call_log]
-        assert models_called == ['instruct', 'coder']  # порядок важен
+        assert models_called == ['instruct', 'coder']  # order matters
 
 
 # ============================================================
-# 9. Пер-модельные параметры генерации
+# 9. PER-MODEL GENERATION PARAMS
 # ============================================================
 class TestPerModelParams:
     def test_coder_uses_its_params(self, mock_manager):
@@ -235,7 +228,7 @@ class TestPerModelParams:
 
 
 # ============================================================
-# 10. mode_single и mode_a_parallel
+# 10. SINGLE AND PARALLEL MODES
 # ============================================================
 class TestSingleAndParallel:
     def test_mode_single_uses_correct_model(self, mock_manager):
@@ -258,57 +251,56 @@ class TestSingleAndParallel:
 
 
 # ============================================================
-# 11. Lazy loading в ModelManager
+# 11. LAZY LOADING
 # ============================================================
 class TestLazyLoading:
     def test_models_not_loaded_at_init(self):
-        """При создании ModelManager модели НЕ грузятся сразу."""
+        """ModelManager must not load model weights at construction."""
         with patch('polar_inference.AutoTokenizer') as mock_tok, \
              patch('polar_inference.AutoModelForCausalLM') as mock_model:
-            mock_tok.from_pretrained.return_value = Mock(pad_token=None, eos_token='</s>')
-            manager = ModelManager(
+            mock_tok.from_pretrained.return_value = Mock(
+                pad_token=None, eos_token='mock-eos')
+            ModelManager(
                 models_config={'instruct': Path('/fake'), 'coder': Path('/fake')},
                 weights_files={'instruct': Path('/fake/w'), 'coder': Path('/fake/w')},
                 layer_info_files={'instruct': Path('/fake/l'), 'coder': Path('/fake/l')},
             )
-            # AutoModelForCausalLM.from_pretrained не должен вызываться
+            # weights must NOT be loaded upfront
             mock_model.from_pretrained.assert_not_called()
-            # Только токенизаторы
+            # tokenizers only
             assert mock_tok.from_pretrained.call_count == 2
 
 
 # ============================================================
-# 12. Граничные случаи
+# 12. EDGE CASES
 # ============================================================
 class TestEdgeCases:
     def test_custom_max_tokens_overrides_default(self, mock_manager):
-        result = mode_b_router(
-            mock_manager, "write a python function",
-            max_new_tokens=100)
+        mode_b_router(mock_manager, "write a python function",
+                      max_new_tokens=100)
         call = mock_manager.call_log[0]
-        assert call['max_new_tokens'] == 100  # override
+        assert call['max_new_tokens'] == 100
 
     def test_custom_abstain_threshold(self, mock_manager):
-        # "python" → conf 0.67; с threshold 0.8 → должна быть абстенция
-        result = mode_b_router(
-            mock_manager, "python",
-            abstain_threshold=0.8)
+        # "python" -> conf 0.67; with threshold 0.8 it must abstain
+        result = mode_b_router(mock_manager, "python", abstain_threshold=0.8)
         assert result['abstained'] is True
         assert 'uncertainty' in result['mode']
 
 
 # ============================================================
-# 13. GPU-пиннинг с TTL и LRU
+# 13. GPU PINNING WITH LRU + TTL
 # ============================================================
 class TestGPUPinning:
     def test_autodetect_resident_limit_with_vram(self):
-        """Автодетект корректно выбирает лимит."""
+        """Autodetect picks the resident limit from VRAM size."""
         with patch('polar_inference.torch.cuda.is_available', return_value=True), \
              patch('polar_inference.torch.cuda.get_device_properties') as mock_props, \
              patch('polar_inference.AutoTokenizer') as mock_tok:
-            # Симулируем 16 ГБ VRAM
+            # simulate 16 GB VRAM
             mock_props.return_value.total_memory = 16 * 1024**3
-            mock_tok.from_pretrained.return_value = Mock(pad_token=None, eos_token='</s>')
+            mock_tok.from_pretrained.return_value = Mock(
+                pad_token=None, eos_token='mock-eos')
 
             manager = ModelManager(
                 models_config={'instruct': Path('/fake'), 'coder': Path('/fake')},
@@ -318,46 +310,44 @@ class TestGPUPinning:
             assert manager.max_resident == 2
 
     def test_second_generate_skips_transfer(self):
-        """Второй вызов той же модели не переносит её на GPU снова."""
+        """Second call of the same model must not transfer to GPU again."""
         manager = self._make_manager_with_mocks(resident_limit=2)
 
-        # Первый вызов: должен перенести на GPU
         manager.generate('instruct', 'hello')
         m = manager.models['instruct']
         assert m.to.call_count == 1
         m.to.reset_mock()
+
         manager.generate('instruct', 'hello again')
         m.to.assert_not_called()
 
     def test_lru_eviction_when_limit_exceeded(self):
-        """При превышении лимита вытесняется самая старая модель."""
+        """On limit overflow the least recently used model is evicted."""
         manager = self._make_manager_with_mocks(resident_limit=1)
 
         manager.generate('instruct', 'prompt 1')
-        manager.generate('coder', 'prompt 2')  # вытесняет instruct
+        manager.generate('coder', 'prompt 2')  # evicts instruct
 
         assert 'coder' in manager.resident_on_gpu
         assert 'instruct' not in manager.resident_on_gpu
-        # instruct был выгружен обратно в CPU
         instruct_model = manager.models['instruct']
         cpu_calls = [c for c in instruct_model.to.call_args_list
                      if c.args[0] == 'cpu']
         assert len(cpu_calls) >= 1
 
     def test_ttl_expires_stale_models(self):
-        """Просроченные модели выгружаются при следующем обращении."""
+        """Expired residents are evicted on the next generate call."""
         manager = self._make_manager_with_mocks(resident_limit=2, ttl=1.0)
         manager.generate('instruct', 'hello')
 
-        # Имитируем истечение TTL
+        # simulate TTL expiry
         manager.resident_on_gpu['instruct'] = time.time() - 10.0
 
-        # Следующий generate должен выгрузить instruct (TTL)
         manager.generate('coder', 'world')
         assert 'instruct' not in manager.resident_on_gpu
 
     def test_force_evict(self):
-        """Принудительная выгрузка работает."""
+        """Manual eviction works."""
         manager = self._make_manager_with_mocks(resident_limit=2)
         manager.generate('instruct', 'hello')
         assert 'instruct' in manager.resident_on_gpu
@@ -366,16 +356,15 @@ class TestGPUPinning:
         assert 'instruct' not in manager.resident_on_gpu
 
     def _make_manager_with_mocks(self, resident_limit, ttl=300.0):
-        """Хелпер: ModelManager с моками моделей и токенизаторов."""
-        import torch as _torch
+        """Helper: ModelManager with mocked models and tokenizers."""
         with patch('polar_inference.AutoTokenizer') as mock_tok, \
              patch('polar_inference.torch.cuda.get_device_properties') as mock_props:
             mock_props.return_value.total_memory = 8 * 1024**3
 
-            # Токенизатор-мок: возвращает настоящий dict с тензорами,
-            # чтобы .items() и .shape работали. Никаких спец-строк.
+            # Tokenizer mock returns a real dict of tensors so that
+            # .items() and .shape work; no special strings anywhere.
             tok = Mock()
-            ids = _torch.zeros(1, 5, dtype=_torch.long)
+            ids = torch.zeros(1, 5, dtype=torch.long)
             tok.return_value = {'input_ids': ids, 'attention_mask': ids}
             tok.decode.return_value = "mock response"
             tok.pad_token = None
@@ -389,15 +378,16 @@ class TestGPUPinning:
                 max_resident_models=resident_limit,
                 pin_ttl_seconds=ttl,
             )
-            manager.device = 'cpu'  # тесты без GPU
+            manager.device = 'cpu'  # tests run without a GPU
 
-            # Модели-моки: .to() возвращает себя, generate — тензор (1, 10)
+            # Model mocks: .to() returns self, generate returns a (1, 10) tensor
             for name in ['instruct', 'coder']:
                 m = MagicMock()
                 m.to.return_value = m
-                m.generate.return_value = _torch.zeros(1, 10, dtype=_torch.long)
+                m.generate.return_value = torch.zeros(1, 10, dtype=torch.long)
                 manager.models[name] = m
             return manager
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
