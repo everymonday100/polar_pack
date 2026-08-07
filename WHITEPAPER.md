@@ -171,17 +171,17 @@ Benchmark, RTX 4060, 4096x4096 layer, polar dual vs two FP16 cuBLAS GEMMs:
 
 | M | polar dual | fp16 dual | ratio |
 |---|---|---|---|
-| 1 (decode) | 0.33 ms | 0.28 ms | 0.83x |
-| 8 | 0.33 ms | 0.28 ms | 0.85x |
-| 32 | 0.45 ms | 0.28 ms | 0.62x |
-| 128 | 0.77 ms | 0.30 ms | 0.40x |
-| 1024 (prefill) | 5.76 ms | 2.28 ms | 0.40x |
+| 1 (decode) | 0.30 ms | 0.27 ms | 0.90x |
+| 8 | 0.30 ms | 0.28 ms | 0.93x |
+| 32 | 0.30 ms | 0.28 ms | 0.92x |
+| 128 | 0.77 ms | 0.29 ms | 0.38x |
+| 1024 (prefill) | 5.82 ms | 2.29 ms | 0.39x |
 
 Reading the table honestly:
 
-- At decode (M=1), **two models run at 83% of the cost of two FP16 models
+- At decode (M=1), **two models run at 90% of the cost of two FP16 models
   while reading half the weight traffic** (33.6 vs 67.1 MB per layer). Against
-  a single FP16 model (~0.14 ms), the second model costs +0.19 ms.
+  a single FP16 model (~0.14 ms), the second model costs +0.16 ms.
 - At prefill, cuBLAS wins. The matmul is compute-bound on tensor cores, and
   per-weight dequant ALU is pure overhead there. The format wins on traffic
   and memory, not on tensor cores - and the write-up does not pretend
