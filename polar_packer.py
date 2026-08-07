@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
 ================================================================
-ESPU PACKER - Dual Model Packing via Polar Phase Quantization
+POLAR PACKER - Dual Model Packing via Polar Phase Quantization
 ================================================================
-Метод: μ-law полярное квантование (production версия)
+Method: mu-law polar quantization (production version)
 
-Параметры production:
-- AMP_BITS = 6     (64 уровня амплитуды)
-- NUM_PHASES = 1024 (10 бит фазы)
-- MU = 255         (фиксированный μ, стандарт G.711)
-- PLUG_CAP = 0.03  (защита 3% outlier'ов)
-- GS = 32          (размер группы для per-group scaling)
+Production parameters:
+- AMP_BITS = 6     (64 amplitude levels)
+- NUM_PHASES = 1024 (10-bit phase)
+- MU = 255         (fixed mu, G.711 standard)
+- PLUG_CAP = 0.03  (protect 3% outliers)
+- GS = 32          (group size for per-group scaling)
 
-Результат:
-- Сжатие 1.97x (две модели в место одной)
-- Бит/вес: 8.12
+Results:
+- Compression: 1.97x (two models in place of one)
+- Bits/weight: 8.12
 - Cosine > 0.9997
-- PPL деградация < 0.6%
-- Скорость: ~7 МВес/с
+- PPL degradation < 0.6%
+- Speed: ~7 MWeights/s
 ================================================================
 """
 import numpy as np
@@ -28,9 +28,8 @@ from typing import Optional
 import json
 import time
 
-
 # ============================================================
-# КОНФИГУРАЦИЯ (production-ready)
+# CONFIGURATION (production-ready)
 # ============================================================
 @dataclass
 class PackerConfig:
@@ -47,54 +46,53 @@ class PackerConfig:
         phase_b = math.ceil(math.log2(self.num_phases)) / 8.0
         return amp_b + phase_b + self.plug_cap
 
-
 # ============================================================
-# μ-law КОДЕК (векторизованный, фиксированный μ)
+# MU-LAW CODEC (vectorized, fixed mu)
 # ============================================================
 def quantize_amplitude_production(
     amp_flat: np.ndarray,
     config: PackerConfig
 ) -> np.ndarray:
     """
-    Production-движок квантования амплитуды.
+    Production amplitude quantization engine.
     
-    Основан на результатах speed_benchmark:
-    - Фиксированный μ=255 (adaptive kurtosis убран — не помогал)
-    - Векторизованные операции
-    - Plug через argpartition (O(n) вместо O(n log n))
+    Based on speed_benchmark results:
+    - Fixed mu=255 (adaptive kurtosis removed - didn't help)
+    - Vectorized operations
+    - Plug via argpartition (O(n) instead of O(n log n))
     """
     levels = 2 ** config.amp_bits - 1
     ol = amp_flat.size
     gs = config.group_size
     mu = config.mu
     
-    # Padding до кратного gs
+    # Padding to multiple of gs
     pad = (gs - ol % gs) % gs
     if pad:
         amp_flat = np.pad(amp_flat, (0, pad))
     
     b = amp_flat.reshape(-1, gs)
     
-    # Векторизованный per-group scaling
+    # Vectorized per-group scaling
     bmax = np.abs(b).max(axis=1, keepdims=True)
     bmax = np.where(bmax > 1e-10, bmax, 1.0)
     norm = b / bmax
     
-    # Векторизованный μ-law compress
+    # Vectorized mu-law compress
     log_mu = np.log1p(mu)
     compressed = np.sign(norm) * np.log1p(mu * np.abs(norm)) / log_mu
     
-    # Квантование
+    # Quantization
     amp_q = np.round(compressed * levels).clip(0, levels)
     
-    # Векторизованный μ-law expand
+    # Vectorized mu-law expand
     amp_restored_norm = np.sign(amp_q) * np.expm1(
         np.abs(amp_q) / levels * log_mu
     ) / mu
     
     decoded = (amp_restored_norm * bmax).ravel()[:ol].copy()
     
-    # PLUG: защита outlier'ов через argpartition (O(n))
+    # PLUG: outlier protection via argpartition (O(n))
     if config.plug_cap > 0:
         flat_core = b.ravel()[:ol]
         e = (flat_core - decoded) ** 2
@@ -105,51 +103,8 @@ def quantize_amplitude_production(
     
     return decoded
 
-
 # ============================================================
-# СБОР ВЕСОВ ИЗ МОДЕЛИ
-# ============================================================
-def collect_weights_to_file(model, output_file: Path, layer_info_file: Path) -> int:
-    """
-    Извлекает веса всех Linear слоёв модели в бинарный файл.
-    Возвращает общее число весов.
-    """
-    import torch
-    
-    total_params = 0
-    layer_info = []
-    
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            n = module.weight.numel()
-            total_params += n
-            layer_info.append({
-                'name': name,
-                'shape': list(module.weight.shape),
-                'numel': n
-            })
-    
-    fp = np.memmap(str(output_file), dtype='float32', mode='w+', shape=(total_params,))
-    
-    offset = 0
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            w = module.weight.data.float().cpu().numpy().ravel()
-            n = w.size
-            fp[offset:offset + n] = w
-            offset += n
-    
-    fp.flush()
-    del fp
-    
-    with open(layer_info_file, 'w') as f:
-        json.dump(layer_info, f)
-    
-    return total_params
-
-
-# ============================================================
-# УПАКОВКА ДВУХ МОДЕЛЕЙ
+# DUAL MODEL PACKING
 # ============================================================
 @dataclass
 class PackingStats:
@@ -170,7 +125,6 @@ class PackingStats:
     pack_time_seconds: float
     throughput_mweights_per_sec: float
 
-
 def pack_dual_models(
     file1: Path,
     file2: Path,
@@ -181,19 +135,19 @@ def pack_dual_models(
     config: Optional[PackerConfig] = None
 ) -> PackingStats:
     """
-    Упаковка двух моделей в полярное пространство.
+    Pack two models into polar space.
     
-    z = w1 + i·w2
-    amplitude = |z| → μ-law квантование
-    phase = angle(z) → равномерная дискретизация
+    z = w1 + i*w2
+    amplitude = |z| -> mu-law quantization
+    phase = angle(z) -> uniform discretization
     
-    Восстановление:
+    Restoration:
     w1 = Re(z), w2 = Im(z)
     """
     if config is None:
         config = PackerConfig()
     
-    print(f"\n🔧 ESPU Packing (μ={config.mu}, {config.amp_bits} bits, "
+    print(f"\n[PACK] Polar packing (mu={config.mu}, {config.amp_bits} bits, "
           f"{config.num_phases} phases)")
     
     fp1 = np.memmap(str(file1), dtype='float32', mode='r')
@@ -235,29 +189,29 @@ def pack_dual_models(
         if len(w2_np) < actual_len:
             w2_np = np.pad(w2_np, (0, actual_len - len(w2_np)))
         
-        # Полярная упаковка: z = w1 + i·w2
+        # Polar packing: z = w1 + i*w2
         w1_t = torch.from_numpy(w1_np)
         w2_t = torch.from_numpy(w2_np)
         z = torch.complex(w1_t, w2_t)
         amplitude = torch.abs(z)
         phase = torch.angle(z)
         
-        # Квантование фазы (со сдвигом на π для [0, 2π])
+        # Phase quantization (shift by pi for [0, 2pi])
         phase_normalized = (phase + np.pi) / (2 * np.pi)
         phase_indices = torch.round(
             phase_normalized * config.num_phases
         ).long() % config.num_phases
         
-        # μ-law квантование амплитуды
+        # Mu-law amplitude quantization
         amp_decoded = quantize_amplitude_production(
             amplitude.numpy(), config
         )
         amp_restored = torch.from_numpy(amp_decoded)
         
-        # Восстановление фазы (со сдвигом -π)
+        # Phase restoration (shift by -pi)
         phase_q = phase_indices.float() / config.num_phases * 2 * np.pi - np.pi
         
-        # Восстановление z и извлечение w1, w2
+        # Restore z and extract w1, w2
         z_restored = amp_restored * torch.exp(1j * phase_q)
         w1_restored = z_restored.real
         w2_restored = z_restored.imag
@@ -270,7 +224,7 @@ def pack_dual_models(
         if n2_chunk > 0:
             out2_fp[start:start + n2_chunk] = w2_restored[:n2_chunk].numpy()
         
-        # Метрики (косинусное сходство)
+        # Metrics (cosine similarity)
         if n1_chunk > 0:
             w1_orig_t = torch.from_numpy(fp1[start:w1_end].copy()[:n1_chunk])
             w1_rest_t = w1_restored[:n1_chunk]
@@ -296,7 +250,7 @@ def pack_dual_models(
         del w1_t, w2_t, w1_np, w2_np
         
         if (chunk_idx + 1) % 10 == 0 or chunk_idx == n_chunks - 1:
-            print(f"   Чанк {chunk_idx + 1}/{n_chunks}")
+            print(f"   Chunk {chunk_idx + 1}/{n_chunks}")
     
     out1_fp.flush()
     out2_fp.flush()
@@ -325,12 +279,11 @@ def pack_dual_models(
         throughput_mweights_per_sec=round(n1 / total_time / 1e6, 2)
     )
 
-
 # ============================================================
-# ЗАМЕНА ВЕСОВ В МОДЕЛИ
+# REPLACE MODEL WEIGHTS
 # ============================================================
 def replace_model_weights(model, weights_file: Path, layer_info_file: Path) -> int:
-    """Заменяет веса Linear слоёв модели на восстановленные."""
+    """Replace Linear layer weights in model with restored weights."""
     import torch
     
     with open(layer_info_file) as f:
@@ -362,9 +315,8 @@ def replace_model_weights(model, weights_file: Path, layer_info_file: Path) -> i
     del fp
     return replaced
 
-
 # ============================================================
-# СОХРАНЕНИЕ ЗАГОЛОВКА .dualpack
+# SAVE .dualpack HEADER
 # ============================================================
 def save_dualpack_header(
     output_file: Path,
@@ -372,8 +324,8 @@ def save_dualpack_header(
     packing_stats: PackingStats
 ):
     """
-    Сохраняет заголовок формата .dualpack.
-    Для будущей интеграции с llama.cpp / vLLM.
+    Save .dualpack format header.
+    For future llama.cpp / vLLM integration.
     """
     header = {
         "magic": "DUALPACK",
@@ -398,4 +350,4 @@ def save_dualpack_header(
     with open(header_file, 'w') as f:
         json.dump(header, f, indent=2)
     
-    print(f"   ✅ Заголовок сохранён: {header_file}")
+    print(f"   [OK] Header saved: {header_file}")
