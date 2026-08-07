@@ -1,144 +1,211 @@
 #!/usr/bin/env python3
 """
 ================================================================
-ESPU MAIN - переключатель режимов: single / parallel / router
+POLAR MAIN - CLI for packing, unpacking and inference
 ================================================================
-python polar_main.py pack     --model1 <p> --model2 <p> --output <dir>
-python polar_main.py single   --work-dir <dir> --model coder --prompt "..."
-python polar_main.py parallel --work-dir <dir> --prompt "..."
-python polar_main.py router   --work-dir <dir> --prompt "..." [--abstain 0.6]
+Commands:
+  pack      collect weights and build polar.dualpack from two models
+  unpack    restore both models from polar.dualpack
+  single    one-model inference
+  parallel  both models answer
+  router    domain-aware routing with abstention
 ================================================================
 """
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 
-
-def _ensure_restored(work_dir: Path):
-    """Если restored-файлов нет, но есть .dualpack — распаковываем."""
-    r1, r2 = work_dir / "model1_restored.dat", work_dir / "model2_restored.dat"
-    if r1.exists() and r2.exists():
-        return
-    dualpack = work_dir / "espu.dualpack"
-    if not dualpack.exists():
-        raise FileNotFoundError(f"Нет {r1.name}/{r2.name} и {dualpack.name} в {work_dir}. Сначала: pack.")
-    from polar_bitpack import unpack_dual_models
-    print(f"📦 Распаковка {dualpack.name} → restored...")
-    unpack_dual_models(dualpack, r1, r2)
+import torch
 
 
-def cmd_pack(args):
-    from polar_packer import PackerConfig, collect_weights_to_file
-    from polar_bitpack import pack_dual_models_packed
+# ============================================================
+# WEIGHT COLLECTION
+# ============================================================
+def collect_weights(model_path: Path, out_weights: Path, out_layers: Path) -> int:
+    """Flatten all Linear weights into an FP32 .dat and write a layer map."""
     from transformers import AutoModelForCausalLM
 
-    output_dir = Path(args.output)
-    output_dir.mkdir(exist_ok=True)
-    print("=" * 70)
-    print("🚀 ESPU PACKER → .dualpack v2 (bit-packed)")
-    print("=" * 70)
+    print(f"   [LOAD] Collecting Linear weights from {model_path.name}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.float16, device_map='cpu')
 
-    specs = [(args.model1, "model1"), (args.model2, "model2")]
-    counts = {}
-    for model_path, tag in specs:
-        dat = output_dir / f"{tag}_weights.dat"
-        info = output_dir / f"{tag}_layers.json"
-        if not dat.exists():
-            print(f"\n📦 Сбор весов: {Path(model_path).name}")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_path, torch_dtype='auto', device_map='cpu')
-            counts[tag] = collect_weights_to_file(model, dat, info)
-            del model
-        else:
-            with open(info) as f:
-                counts[tag] = sum(x['numel'] for x in json.load(f))
+    entries = []
+    with open(out_weights, 'wb') as f:
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                w = module.weight.data.float().cpu().numpy().ravel()
+                entries.append({
+                    'name': name,
+                    'shape': list(module.weight.shape),
+                    'numel': int(module.weight.numel()),
+                })
+                w.tofile(f)
 
-    config = PackerConfig(amp_bits=args.amp_bits, num_phases=args.num_phases,
-                          mu=args.mu, plug_cap=args.plug_cap)
-    stats = pack_dual_models_packed(
-        output_dir / "model1_weights.dat", output_dir / "model2_weights.dat",
-        counts['model1'], counts['model2'],
-        output_dir / "espu.dualpack", config)
+    with open(out_layers, 'w') as f:
+        json.dump(entries, f, indent=1)
 
-    print(f"\n📊 Сжатие: {stats.compression_ratio:.2f}x | "
-          f"{stats.bits_per_weight:.2f} бит/вес")
+    total = sum(e['numel'] for e in entries)
+    del model
+    print(f"   [OK] {len(entries)} Linear layers, {total} weights")
+    return total
+
+
+def ensure_weights(work: Path, path1: Path, path2: Path):
+    """Collect FP32 weight dumps + layer maps if not present yet."""
+    w1, l1 = work / 'model1_weights.dat', work / 'model1_layers.json'
+    w2, l2 = work / 'model2_weights.dat', work / 'model2_layers.json'
+    if not (w1.exists() and l1.exists()):
+        collect_weights(path1, w1, l1)
+    if not (w2.exists() and l2.exists()):
+        collect_weights(path2, w2, l2)
+    n1 = sum(e['numel'] for e in json.load(open(l1)))
+    n2 = sum(e['numel'] for e in json.load(open(l2)))
+    return w1, w2, l1, l2, n1, n2
+
+
+def ensure_restored(work: Path):
+    """Unpack polar.dualpack into restored FP32 dumps if missing."""
+    from polar_bitpack import unpack_dual_models
+    r1 = work / 'model1_restored.dat'
+    r2 = work / 'model2_restored.dat'
+    packed = work / 'polar.dualpack'
+    if not (r1.exists() and r2.exists()):
+        assert packed.exists(), "run `pack` first (polar.dualpack not found)"
+        print("   [UNPACK] Restoring models from polar.dualpack...")
+        unpack_dual_models(packed, r1, r2)
+    return r1, r2
+
+
+# ============================================================
+# COMMANDS
+# ============================================================
+def cmd_pack(args):
+    from polar_packer import PackerConfig, save_dualpack_header
+    from polar_bitpack import pack_dual_models_packed
+
+    work = Path(args.work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    w1, w2, l1, l2, n1, n2 = ensure_weights(
+        work, Path(args.path1), Path(args.path2))
+
+    config = PackerConfig()
+    stats = pack_dual_models_packed(w1, w2, n1, n2, work / 'polar.dualpack', config)
+
+    models_info = [
+        {"name": "instruct", "path": str(args.path1), "n": n1},
+        {"name": "coder",    "path": str(args.path2), "n": n2},
+    ]
+    save_dualpack_header(work / 'polar.dualpack', models_info, stats)
+
+    print("\n======================================================================")
+    print("PACK RESULTS")
+    print("======================================================================")
+    print(f"   Compression: {stats.compression_ratio:.2f}x")
+    print(f"   Bits/weight: {stats.bits_per_weight:.2f}")
+    print(f"   Packed size: {stats.packed_size_mb:.1f} MB "
+          f"(original {stats.original_size_mb:.1f} MB)")
     print(f"   Cosine: {stats.cos1:.6f} / {stats.cos2:.6f}")
-    print(f"   Размер: {stats.packed_size_mb:.0f} MB "
-          f"(было {stats.original_size_mb:.0f} MB две FP16)")
-    with open(output_dir / "packing_stats.json", 'w') as f:
-        json.dump(stats.__dict__, f, indent=2)
+    print(f"   Time: {stats.pack_time_seconds:.1f}s "
+          f"({stats.throughput_mweights_per_sec:.1f} MWeights/s)")
+
+    with open(work / 'packing_stats.json', 'w') as f:
+        json.dump(asdict(stats), f, indent=2)
+
+
+def cmd_unpack(args):
+    from polar_bitpack import unpack_dual_models
+    work = Path(args.work_dir)
+    unpack_dual_models(work / 'polar.dualpack',
+                       work / 'model1_restored.dat',
+                       work / 'model2_restored.dat')
 
 
 def cmd_inference(args):
-    from polar_inference import ModelManager, mode_single, mode_a_parallel, mode_b_router
-    work_dir = Path(args.work_dir)
-    _ensure_restored(work_dir)
+    from polar_inference import (ModelManager, mode_single,
+                                 mode_a_parallel, mode_b_router)
 
-    models_config = {args.name1: Path(args.path1), args.name2: Path(args.path2)}
-    weights_files = {args.name1: work_dir / "model1_restored.dat",
-                     args.name2: work_dir / "model2_restored.dat"}
-    layer_info_files = {args.name1: work_dir / "model1_layers.json",
-                        args.name2: work_dir / "model2_layers.json"}
+    work = Path(args.work_dir)
+    ensure_weights(work, Path(args.path1), Path(args.path2))
+    r1, r2 = ensure_restored(work)
 
-    print("=" * 70)
-    print(f"🚀 ESPU INFERENCE - {args.mode}")
-    print("=" * 70)
-    manager = ModelManager(models_config, weights_files, layer_info_files)
-    try:
-        if args.mode == 'single':
-            result = mode_single(manager, args.prompt, args.model, args.max_tokens)
-        elif args.mode == 'parallel':
-            result = mode_a_parallel(manager, args.prompt, args.max_tokens)
-        else:
-            result = mode_b_router(manager, args.prompt, args.max_tokens, args.abstain)
+    models_config = {'instruct': Path(args.path1), 'coder': Path(args.path2)}
+    weights_files = {'instruct': r1, 'coder': r2}
+    layer_files = {'instruct': work / 'model1_layers.json',
+                   'coder':    work / 'model2_layers.json'}
 
-        print(f"\n{'='*70}\n📊 РЕЗУЛЬТАТ [{result['mode']}]\n{'='*70}")
-        if 'results' in result:
-            for name, data in result['results'].items():
-                print(f"\n🧠 {name}:\n   {data['response'][:300]}")
-        else:
-            if 'routing' in result:
-                r = result['routing']
-                print(f"🎯 {r['model']} (conf {r['confidence']:.2f}) | {r['reasoning']}")
-            print(f"\n💬 {result['response'][:400]}")
+    manager = ModelManager(models_config, weights_files, layer_files)
 
-        with open(work_dir / f"mode_{args.mode}_result.json", 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-    finally:
-        manager.cleanup()
+    if args.command == 'single':
+        result = mode_single(manager, args.prompt, args.model, args.max_tokens)
+    elif args.command == 'parallel':
+        result = mode_a_parallel(manager, args.prompt, args.max_tokens)
+    else:
+        result = mode_b_router(manager, args.prompt, args.max_tokens, args.abstain)
+
+    print_result(result)
+
+    out = work / f'mode_{args.command}_result.json'
+    with open(out, 'w') as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    print(f"\n   [OK] Result saved: {out}")
 
 
+def print_result(result):
+    print("\n======================================================================")
+    print(f"RESULT [{result['mode']}]")
+    print("======================================================================")
+    if 'routing' in result:
+        r = result['routing']
+        print(f"[ROUTE] {r['model']} (conf {r['confidence']:.2f}) | {r['reasoning']}")
+        if r.get('abstain_reason'):
+            print(f"[ABSTAIN] reason: {r['abstain_reason']}")
+    if 'results' in result:
+        for name, item in result['results'].items():
+            print(f"\n[{name}]:\n   {item['response']}")
+    elif 'response' in result:
+        print(f"\n{result['response']}")
+
+
+# ============================================================
+# CLI
+# ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="ESPU: single / parallel / router")
-    sub = parser.add_subparsers(dest='command', required=True)
+    p = argparse.ArgumentParser(description="Polar Dual-Model Packing CLI")
+    sub = p.add_subparsers(dest='command', required=True)
 
-    p = sub.add_parser('pack')
-    p.add_argument('--model1', required=True); p.add_argument('--model2', required=True)
-    p.add_argument('--output', required=True)
-    p.add_argument('--amp-bits', type=int, default=6)
-    p.add_argument('--num-phases', type=int, default=1024)
-    p.add_argument('--mu', type=int, default=255)
-    p.add_argument('--plug-cap', type=float, default=0.03)
-    p.set_defaults(func=cmd_pack)
+    base = argparse.ArgumentParser(add_help=False)
+    base.add_argument('--work-dir', default='dual_pack_work')
 
-    def infer_args(sp, mode):
-        sp.add_argument('--work-dir', required=True)
-        sp.add_argument('--path1', required=True); sp.add_argument('--path2', required=True)
-        sp.add_argument('--name1', default='instruct'); sp.add_argument('--name2', default='coder')
+    models = argparse.ArgumentParser(add_help=False)
+    models.add_argument('--path1', required=True,
+                        help='HF path of model 1 (instruct)')
+    models.add_argument('--path2', required=True,
+                        help='HF path of model 2 (coder)')
+
+    sub.add_parser('pack', parents=[base, models],
+                   help='build polar.dualpack from two models')
+    sub.add_parser('unpack', parents=[base],
+                   help='restore both models from polar.dualpack')
+
+    for name in ['single', 'parallel', 'router']:
+        sp = sub.add_parser(name, parents=[base, models])
         sp.add_argument('--prompt', required=True)
-        sp.add_argument('--max-tokens', type=int, default=256)
-        if mode == 'single':
-            sp.add_argument('--model', choices=['instruct', 'coder'], default='instruct')
-        if mode == 'router':
-            sp.add_argument('--abstain', type=float, default=0.6)
-        sp.set_defaults(func=cmd_inference, mode=mode)
+        sp.add_argument('--max-tokens', type=int, default=None)
+        if name == 'single':
+            sp.add_argument('--model', default='instruct',
+                            choices=['instruct', 'coder'])
+        if name == 'router':
+            sp.add_argument('--abstain', type=float, default=0.6,
+                            help='confidence threshold for abstention')
 
-    infer_args(sub.add_parser('single'), 'single')
-    infer_args(sub.add_parser('parallel'), 'parallel')
-    infer_args(sub.add_parser('router'), 'router')
-
-    args = parser.parse_args()
-    args.func(args)
+    args = p.parse_args()
+    if args.command == 'pack':
+        cmd_pack(args)
+    elif args.command == 'unpack':
+        cmd_unpack(args)
+    else:
+        cmd_inference(args)
 
 
 if __name__ == "__main__":
