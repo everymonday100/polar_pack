@@ -106,13 +106,13 @@ A fused bit-packed dual matmul serves **both models in one pass**:
 | 128 | 0.77 ms | 0.29 ms | 0.38× |
 | 1024 (prefill) | 5.82 ms | 2.29 ms | 0.39× |
 
-At decode, two models run at 82% of the cost of two FP16 GEMMs while reading
+At decode, two models run at 90% of the cost of two FP16 GEMMs while reading
 **2× less weight traffic** (33.6 vs 67.1 MB per 4096² layer). Prefill stays with
 cuBLAS — the format wins on traffic and memory, not on tensor cores.
 Honest by design.
 
 Optimization journey (M=1): naive 0.22× → LUT dequant 0.22× (accuracy 22%→2.4%)
-→ dual+INT16 0.35× → bit-packed + autotune **0.82×**.
+→ dual+INT16 0.35× → bit-packed + autotune **0.90×**.
 
 ## Repository layout
 
