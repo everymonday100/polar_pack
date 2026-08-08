@@ -198,48 +198,61 @@ def unpack_dual_models(packed: Path, out1: Path, out2: Path):
          gs, chunk_size, plug_n) = struct.unpack(HEADER_FMT, f.read(hs))
         assert magic == MAGIC and ver == VERSION, "wrong .dualpack format"
 
-        codes = _deinterleave(np.frombuffer(f.read(n_pairs * 2), dtype=np.uint8))
         n_groups = 0
         for s in range(0, n_pairs, chunk_size):
             n_groups += math.ceil(min(chunk_size, n_pairs - s) / gs)
-        scales = np.frombuffer(f.read(n_groups * 2), dtype=np.float16).astype(np.float32)
+
+        codes_offset = hs
+        scales_offset = codes_offset + n_pairs * 2
+        plug_i_offset = scales_offset + n_groups * 2
+
+        f.seek(plug_i_offset)
         plug_i = np.frombuffer(f.read(plug_n * 4), dtype=np.uint32).copy()
         plug_v = np.frombuffer(f.read(plug_n * 2), dtype=np.float16).copy()
 
     levels = 2 ** amp_bits - 1
     log_mu = np.log1p(mu)
     phase_mask = (1 << phase_bits) - 1
-    amp_q = (codes >> phase_bits) & levels
-    phase_idx = codes & phase_mask
 
     out1_fp = np.memmap(str(out1), dtype='float32', mode='w+', shape=(n1,))
     out2_fp = np.memmap(str(out2), dtype='float32', mode='w+', shape=(n2,))
 
-    g_off = 0
-    p_lo = np.searchsorted(plug_i, 0)
-    for start in range(0, n_pairs, chunk_size):
-        end = min(start + chunk_size, n_pairs)
-        L = end - start
+    n_chunks = (n_pairs + chunk_size - 1) // chunk_size
+    with open(packed, 'rb') as f:
+        g_off = 0
+        p_lo = np.searchsorted(plug_i, 0)
+        for ci, start in enumerate(range(0, n_pairs, chunk_size)):
+            end = min(start + chunk_size, n_pairs)
+            L = end - start
 
-        amp_norm = np.expm1(amp_q[start:end].astype(np.float64) / levels * log_mu) / mu
-        n_g = math.ceil(L / gs)
-        scale = np.repeat(scales[g_off:g_off + n_g], gs)[:L]
-        g_off += n_g
-        amp = (amp_norm * scale).astype(np.float32)
+            f.seek(codes_offset + start * 2)
+            codes = _deinterleave(np.frombuffer(f.read(L * 2), dtype=np.uint8))
+            amp_q = (codes >> phase_bits) & levels
+            phase_idx = codes & phase_mask
 
-        p_hi = np.searchsorted(plug_i, end)
-        if p_hi > p_lo:
-            amp[plug_i[p_lo:p_hi] - start] = plug_v[p_lo:p_hi].astype(np.float32)
-        p_lo = p_hi
+            f.seek(scales_offset + g_off * 2)
+            n_g = math.ceil(L / gs)
+            scale = np.frombuffer(f.read(n_g * 2), dtype=np.float16).astype(np.float32)
 
-        ang = phase_idx[start:end].astype(np.float64) / (phase_mask + 1) * 2 * np.pi - np.pi
-        w1 = amp * np.cos(ang)
-        w2 = amp * np.sin(ang)
+            amp_norm = np.expm1(amp_q.astype(np.float64) / levels * log_mu) / mu
+            amp = (amp_norm * np.repeat(scale, gs)[:L]).astype(np.float32)
 
-        if start < n1:
-            out1_fp[start:min(end, n1)] = w1[:min(end, n1) - start]
-        if start < n2:
-            out2_fp[start:min(end, n2)] = w2[:min(end, n2) - start]
+            p_hi = np.searchsorted(plug_i, end)
+            if p_hi > p_lo:
+                amp[plug_i[p_lo:p_hi] - start] = plug_v[p_lo:p_hi].astype(np.float32)
+            p_lo = p_hi
+
+            ang = phase_idx.astype(np.float64) / (phase_mask + 1) * 2 * np.pi - np.pi
+            w1 = amp * np.cos(ang)
+            w2 = amp * np.sin(ang)
+
+            if start < n1:
+                out1_fp[start:min(end, n1)] = w1[:min(end, n1) - start]
+            if start < n2:
+                out2_fp[start:min(end, n2)] = w2[:min(end, n2) - start]
+
+            g_off += n_g
+            print(f"   Chunk {ci + 1}/{n_chunks}")
 
     out1_fp.flush()
     out2_fp.flush()
