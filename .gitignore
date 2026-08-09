@@ -1,0 +1,24 @@
+# Working directories
+work/
+dual_pack_*/
+quad_restored/
+*.dat
+
+# Packed files (14 GB +)
+*.dualpack
+*.quadpack
+
+# Python
+__pycache__/
+*.pyc
+env_*/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
